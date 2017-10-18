@@ -23,6 +23,8 @@ import (
 	"strconv"
 	"strings"
 
+	"io/ioutil"
+
 	actypes "github.com/appc/spec/schema/types"
 	"github.com/golang/glog"
 	"github.com/pborman/uuid"
@@ -53,6 +55,7 @@ const (
 	// Also, do we want more granularity than path-at-the-kubelet-level and
 	// image/name-at-the-pod-level?
 	k8sRktStage1NameAnno = "rkt.alpha.kubernetes.io/stage1-name-override"
+	nodeEtcHost          = "/etc/hosts"
 )
 
 // List of reserved keys in the annotations.
@@ -208,6 +211,19 @@ func generateSeccompArg(annotations map[string]string, containerName string) (st
 	return "", fmt.Errorf("seccomp profile %q not supported", profile)
 }
 
+func copyMissingPodEtcHost(src, dst string) error {
+	_, err := os.Stat(dst)
+	if err == nil {
+		return nil
+	}
+	glog.V(8).Infof("copying content of file %s to %s", src, dst)
+	data, err := ioutil.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return ioutil.WriteFile(dst, data, 0644)
+}
+
 func generateAppAddCommand(req *runtimeApi.CreateContainerRequest, imageID string) ([]string, error) {
 	config := req.Config
 
@@ -351,6 +367,22 @@ func generateAppAddCommand(req *runtimeApi.CreateContainerRequest, imageID strin
 		cmd = append(cmd, "--working-dir="+config.WorkingDir)
 	}
 
+	if hasHostNetwork(req.SandboxConfig) {
+		podEtcHost := path.Join("/var/lib/kubelet/pods", req.SandboxConfig.Metadata.Uid, "etc-hosts")
+		err := copyMissingPodEtcHost(nodeEtcHost, podEtcHost)
+		if err != nil {
+			glog.Errorf("fail to copy host file /etc/hosts %s: %s", podEtcHost, err)
+			return nil, err
+		}
+		m := runtimeApi.Mount{
+			ContainerPath:  nodeEtcHost,
+			HostPath:       podEtcHost,
+			Readonly:       false,
+			SelinuxRelabel: false,
+		}
+		config.Mounts = append(config.Mounts, &m)
+	}
+
 	for _, mnt := range config.GetMounts() {
 		if mnt == nil {
 			glog.Warningf("unexpected nil mount: %v, %+v", mnt, config)
@@ -466,7 +498,7 @@ func generateAppSandboxCommand(req *runtimeApi.RunPodSandboxRequest, uuidfile, s
 
 	// Add hostnetwork
 	if hasHostNetwork(req.GetConfig()) {
-		cmd = append(cmd, "--net=host", "--hosts-entry=host")
+		cmd = append(cmd, "--net=host")
 		if hn, err := os.Hostname(); err == nil {
 			cmd = append(cmd, fmt.Sprintf("--hostname=%s", hn))
 		}
